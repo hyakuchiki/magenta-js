@@ -378,4 +378,168 @@ export class MusicRNN {
     }
     return {samples, probs};
   }
+
+  private sampleRnnBatched(
+      inputs: tf.Tensor2D, steps: number, temperature: number, batchSize: number,
+      controls?: tf.Tensor2D, auxInputs?: tf.Tensor2D, returnProbs?: boolean) {
+    const length: number = inputs.shape[0];
+    const outputSize: number = inputs.shape[1];
+
+    let c: tf.Tensor2D[] = [];
+    let h: tf.Tensor2D[] = [];
+    for (let i = 0; i < this.biasShapes.length; i++) {
+      c.push(tf.zeros([1, this.biasShapes[i] / 4]));
+      h.push(tf.zeros([1, this.biasShapes[i] / 4]));
+    }
+
+    let attentionState =
+        this.attentionWrapper ? this.attentionWrapper.initState() : null;
+    let lastOutput: tf.Tensor2D;
+
+    // Initialize with input.
+    inputs = inputs.toFloat();
+    const samples: tf.Tensor2D[] = [];
+    const probs: tf.Tensor2D[] = [];
+    const splitInputs = tf.split(inputs.toFloat(), length);
+    const splitControls =
+        controls ? tf.split(controls, controls.shape[0]) : undefined;
+    const splitAuxInputs =
+        auxInputs ? tf.split(auxInputs, auxInputs.shape[0]) : undefined;
+    for (let i = 0; i < length + steps; i++) {
+      let nextInput: tf.Tensor2D;
+      if (i < length) {
+         //tile to batch dimension
+        nextInput = splitInputs[i].tile([batchSize, 1]);
+      } else {
+        //batch, n_classes
+        let logits = lastOutput.matMul(this.lstmFcW).add(this.lstmFcB).as2D(batchSize, outputSize);
+
+        let sampledOutput: tf.Tensor1D;
+        if (temperature) {
+          logits = logits.div(tf.scalar(temperature));
+          sampledOutput = tf.multinomial(logits, 1).as1D();
+        } else {
+          sampledOutput = logits.argMax();
+        }
+
+        if (returnProbs) {
+          probs.push(tf.softmax(logits));
+        }
+        // batch, outputSize
+        nextInput = tf.oneHot(sampledOutput, outputSize).toFloat().as2D(batchSize, outputSize);
+        // Save samples as bool to reduce data sync time.
+        
+        samples.push(nextInput); //[Tensor(batch, outputSize)]
+      }
+      // No need to run an RNN step once we have all our samples.
+      if (i === length + steps - 1) {
+        break;
+      }
+
+      const tensors = [];
+      if (splitControls) {
+        tensors.push(splitControls[i + 1].tile([batchSize, 1]));
+      }
+      tensors.push(nextInput);
+      if (splitAuxInputs) {
+        tensors.push(splitAuxInputs[i].tile([batchSize, 1]));
+      }
+      nextInput = tf.concat(tensors, 1);
+
+      if (this.attentionWrapper) {
+        const wrapperOutput =
+            this.attentionWrapper.call(nextInput, c, h, attentionState);
+        c = wrapperOutput.c;
+        h = wrapperOutput.h;
+        attentionState = wrapperOutput.attentionState;
+        lastOutput = wrapperOutput.output;
+      } else {
+        [c, h] = tf.multiRNNCell(this.lstmCells, nextInput, c, h);
+        lastOutput = h[h.length - 1];
+      }
+    }
+    return {samples, probs};
+  }
+
+  private async continueSequenceImplBatched(
+    sequence: INoteSequence, steps: number, batchSize: number, temperature?: number,
+    chordProgression?: string[], returnProbs?: boolean):
+    Promise<{sequence: Promise<INoteSequence>[]; probs: Float32Array[]}> {
+    sequences.assertIsRelativeQuantizedSequence(sequence);
+
+    if (this.chordEncoder && !chordProgression) {
+      throw new Error('Chord progression expected but not provided.');
+    }
+    if (!this.chordEncoder && chordProgression) {
+      throw new Error('Unexpected chord progression provided.');
+    }
+
+    if (!this.initialized) {
+      await this.initialize();
+    }
+
+    const startTime = performance.now();
+
+    const oh = tf.tidy(() => {
+      const inputs = this.dataConverter.toTensor(sequence);
+      const length: number = inputs.shape[0];
+      const outputSize: number = inputs.shape[1];
+      const controls = this.chordEncoder ?
+          this.chordEncoder.encodeProgression(
+              chordProgression, length + steps) :
+          undefined;
+      const auxInputs = this.auxInputs ?
+          tf.concat(
+              this.auxInputs.map(
+                  auxInput => auxInput.getTensors(length + steps)),
+              1) :
+          undefined;
+      const rnnResult = this.sampleRnnBatched(
+          inputs, steps, batchSize, temperature, controls, auxInputs, returnProbs);
+      const timeLength = rnnResult.samples.length;
+      const samples = tf.stack(rnnResult.samples).as3D(timeLength, batchSize, outputSize);
+      const splitSamples: tf.Tensor3D[] = tf.split(samples, 1);
+      const splitSamples2D: tf.Tensor2D[] = [];
+      const splitProbs: tf.Tensor3D[] = tf.split(tf.stack(rnnResult.probs).as3D(timeLength, batchSize, outputSize), 1);
+      const splitProbs2D: tf.Tensor2D[] = [];
+      for (let i=0; i < splitSamples.length; i++){
+        splitSamples2D.push(splitSamples[i].as2D(batchSize, outputSize))
+        splitProbs2D.push(splitProbs[i].as2D(batchSize, outputSize))
+      }
+      return {
+        //samples, probs: [Tensor(timeLength, outputSize),...] * batch
+        samples: splitSamples2D,
+        probs: splitProbs2D
+      };
+    });
+    const samplesAndProbs = await oh;
+    const result = [];
+    for (let i=0; i < batchSize; i++){
+      result.push(this.dataConverter.toNoteSequence(samplesAndProbs.samples[i], sequence.quantizationInfo.stepsPerQuarter));
+      oh.samples[i].dispose();
+    }
+    // Convert the array of 2D tensors into an array of array of arrays.
+    const probs: Float32Array[] = [];
+    if (returnProbs) {
+      for (let i = 0; i < samplesAndProbs.probs.length; i++) {
+        probs.push(await samplesAndProbs.probs[i].data() as Float32Array);
+        samplesAndProbs.probs[i].dispose();
+      }
+    }
+
+    // result.then(
+    //     () => logging.logWithDuration(
+    //         'Continuation completed', startTime, 'MusicRNN',
+    //         logging.Level.DEBUG));
+    return {sequence: result, probs};
+  }
+
+  async continueSequenceBatched(
+    sequence: INoteSequence, steps: number, batchSize: number, temperature?: number,
+    chordProgression?: string[]): Promise<Promise<INoteSequence>[]> {
+    const result = await this.continueSequenceImplBatched(
+        sequence, steps, batchSize, temperature, chordProgression, false);
+    return result.sequence;
+  }
 }
+
